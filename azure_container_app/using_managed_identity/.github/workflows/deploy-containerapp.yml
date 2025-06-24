@@ -1,0 +1,123 @@
+name: Deploy FastAPI App with Managed Identity
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Choose environment'
+        required: true
+        type: choice
+        options: [dev, stage, prod]
+
+env:
+  ACR_NAME: youracrname
+  RESOURCE_GROUP: your-resource-group
+  CONTAINER_APP_ENV: your-containerapp-env
+  IMAGE_NAME: fastapi-app
+  STORAGE_ACCOUNT_NAME: yourstorageaccount
+  COSMOS_ACCOUNT_NAME: yourcosmosaccount
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to ACR
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.ACR_NAME }}.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push image
+        run: |
+          docker build -t ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Azure login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup environment variables
+        run: |
+          echo "ENV=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
+
+      - name: Create or get Managed Identity
+        id: umi
+        run: |
+          IDENTITY_NAME="fastapi-identity-${ENV}"
+          IDENTITY_JSON=$(az identity show --name $IDENTITY_NAME --resource-group ${{ env.RESOURCE_GROUP }} 2>/dev/null || true)
+          if [ -z "$IDENTITY_JSON" ]; then
+            echo "Creating identity $IDENTITY_NAME"
+            IDENTITY_JSON=$(az identity create --name $IDENTITY_NAME --resource-group ${{ env.RESOURCE_GROUP }})
+          fi
+          IDENTITY_ID=$(echo $IDENTITY_JSON | jq -r .id)
+          echo "IDENTITY_ID=$IDENTITY_ID" >> $GITHUB_ENV
+
+      - name: Assign roles to identity
+        run: |
+          STORAGE_ID=$(az storage account show --name ${{ env.STORAGE_ACCOUNT_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --query id -o tsv)
+          COSMOS_ID=$(az cosmosdb show --name ${{ env.COSMOS_ACCOUNT_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --query id -o tsv)
+
+          az role assignment create --assignee $IDENTITY_ID --role "Storage Blob Data Reader" --scope $STORAGE_ID || true
+          az role assignment create --assignee $IDENTITY_ID --role "Cosmos DB Built-in Data Reader" --scope $COSMOS_ID || true
+
+      - name: Deploy/update Container App
+        run: |
+          APP_NAME="my-fastapi-app-${ENV}"
+          IMAGE="${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+
+          COSMOS_CONN="${{ secrets['COSMOS_CONN_' + env.ENV | upper] }}"
+          COSMOS_DB="${{ secrets['COSMOS_DB_' + env.ENV | upper] }}"
+          COSMOS_COLLECTION="${{ secrets['COSMOS_COLLECTION_' + env.ENV | upper] }}"
+          BLOB_URL="https://${{ env.STORAGE_ACCOUNT_NAME }}.blob.core.windows.net"
+
+          EXISTS=$(az containerapp show --name $APP_NAME --resource-group ${{ env.RESOURCE_GROUP }} 2>/dev/null || echo "")
+
+          if [ -z "$EXISTS" ]; then
+            echo "Creating container app $APP_NAME"
+            az containerapp create \
+              --name $APP_NAME \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --environment ${{ env.CONTAINER_APP_ENV }} \
+              --image $IMAGE \
+              --ingress external \
+              --target-port 80 \
+              --assign-identity $IDENTITY_ID \
+              --env-vars COSMOS_MONGO_CONNECTION_STRING="$COSMOS_CONN" \
+                         COSMOS_DATABASE_NAME="$COSMOS_DB" \
+                         COSMOS_COLLECTION_NAME="$COSMOS_COLLECTION" \
+                         BLOB_ACCOUNT_URL="$BLOB_URL"
+          else
+            echo "Updating container app $APP_NAME"
+            az containerapp update \
+              --name $APP_NAME \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --image $IMAGE \
+              --env-vars COSMOS_MONGO_CONNECTION_STRING="$COSMOS_CONN" \
+                         COSMOS_DATABASE_NAME="$COSMOS_DB" \
+                         COSMOS_COLLECTION_NAME="$COSMOS_COLLECTION" \
+                         BLOB_ACCOUNT_URL="$BLOB_URL"
+          fi
+
+      - name: Output endpoint
+        run: |
+          URL=$(az containerapp show --name my-fastapi-app-${{ env.ENV }} --resource-group ${{ env.RESOURCE_GROUP }} --query properties.configuration.ingress.fqdn -o tsv)
+          echo "API URL: https://$URL/api/function"
+      
+      - name: Trigger ingestion run
+        env:
+          ENV: ${{ github.event.inputs.environment }}
+        run: |
+          # Call the container app endpoint to start ingestion OR 
+          # exec into container and run ingestion script (if exposed)
+          # For demo: Assuming container app runs ingestion on start
+          echo "Ingestion triggered for $ENV environment"
