@@ -1,0 +1,86 @@
+name: Deploy FastAPI ContainerApp
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Choose environment to deploy'
+        required: true
+        type: choice
+        options:
+          - dev
+          - stage
+          - prod
+
+env:
+  ACR_NAME: youracrname           # Your Azure Container Registry name (no domain)
+  RESOURCE_GROUP: your-rg-name
+  CONTAINER_APP_ENV: your-container-app-env   # Azure Container Apps Environment name
+  IMAGE_NAME: fastapi-app
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Azure Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.ACR_NAME }}.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push Docker image
+        run: |
+          docker build -t ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure Container App
+        env:
+          ENV: ${{ github.event.inputs.environment }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          CONTAINER_APP_NAME="my-fastapi-app-${ENV}"
+
+          # Set env vars per environment here or fetch from GitHub secrets (recommended)
+          if [ "$ENV" == "dev" ]; then
+            COSMOS_CONN_STR="${{ secrets.COSMOS_CONN_DEV }}"
+            COSMOS_DB="${{ secrets.COSMOS_DB_DEV }}"
+            COSMOS_COLLECTION="${{ secrets.COSMOS_COLLECTION_DEV }}"
+            HTTP_POST_URL="${{ secrets.HTTP_POST_URL_DEV }}"
+          elif [ "$ENV" == "stage" ]; then
+            COSMOS_CONN_STR="${{ secrets.COSMOS_CONN_STAGE }}"
+            COSMOS_DB="${{ secrets.COSMOS_DB_STAGE }}"
+            COSMOS_COLLECTION="${{ secrets.COSMOS_COLLECTION_STAGE }}"
+            HTTP_POST_URL="${{ secrets.HTTP_POST_URL_STAGE }}"
+          else
+            COSMOS_CONN_STR="${{ secrets.COSMOS_CONN_PROD }}"
+            COSMOS_DB="${{ secrets.COSMOS_DB_PROD }}"
+            COSMOS_COLLECTION="${{ secrets.COSMOS_COLLECTION_PROD }}"
+            HTTP_POST_URL="${{ secrets.HTTP_POST_URL_PROD }}"
+          fi
+
+          az account set --subscription ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+          # Deploy/update container app with new image and env vars
+          az containerapp update \
+            --name $CONTAINER_APP_NAME \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:$IMAGE_TAG \
+            --env-vars COSMOS_MONGO_CONNECTION_STRING="$COSMOS_CONN_STR" \
+                       COSMOS_DATABASE_NAME="$COSMOS_DB" \
+                       COSMOS_COLLECTION_NAME="$COSMOS_COLLECTION" \
+                       HTTP_POST_URL="$HTTP_POST_URL"
+
+          echo "Deployment to $CONTAINER_APP_NAME complete."

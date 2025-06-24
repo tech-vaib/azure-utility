@@ -1,0 +1,54 @@
+name: Deploy Azure Function to Cosmos DB environments
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  AZURE_RESOURCE_GROUP: your-resource-group-name
+  AZURE_SUBSCRIPTION_ID: your-subscription-id
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install Azure CLI
+      run: |
+        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Set subscription
+      run: az account set --subscription ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Deploy Azure Function app
+      env:
+        ENV: ${{ github.event.inputs.environment }}
+      run: |
+        FUNC_APP_NAME="your-functionapp-${ENV}"
+        echo "Deploying to $ENV environment - Function App: $FUNC_APP_NAME"
+
+        # Deploy function code
+        func azure functionapp publish $FUNC_APP_NAME --python
+
+    - name: Verify deployment
+      run: az functionapp show --name "your-functionapp-${{ github.event.inputs.environment }}" --resource-group ${{ env.AZURE_RESOURCE_GROUP }}
