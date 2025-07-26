@@ -1,0 +1,168 @@
+#Install Istio using istioctl or Helm with CNI disabled:
+istioctl install --set profile=default --set components.cni.enabled=false
+
+## skip this to not use CNI ,Ensure your cluster allows NET_ADMIN
+helm install istio/cni
+
+---------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kr-app
+  namespace: kr-biz
+  labels:
+    app: kr-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: kr-app
+  template:
+    metadata:
+      labels:
+        app: kr-app
+    spec:
+      containers:
+        - name: kr-app
+          image: ghcr.io/org/chat-service:latest
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 5
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 300m
+              memory: 512Mi
+            limits:
+              cpu: 800m
+              memory: 1024Mi
+
+
+
+------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: kr-app
+  namespace: kr-biz
+  labels:
+    app: kr-app
+spec:
+  selector:
+    app: kr-app
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+
+---------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: kr-app
+  namespace: kr-biz
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: kr-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+---------
+#Istio DestinationRule (Circuit Breakers, Pooling)
+
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: kr-app
+  namespace: kr-biz
+spec:
+  host: kr-app.kr-biz.svc.cluster.local
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 2000
+      http:
+        http1MaxPendingRequests: 1000
+        maxRequestsPerConnection: 1000
+    outlierDetection:
+      consecutiveErrors: 5
+      interval: 5s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+-----------
+#Istio VirtualService (Retries, Timeouts)
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: kr-app
+  namespace: kr-biz
+spec:
+  hosts:
+    - kr-app.kr-biz.svc.cluster.local
+    - kr-app.yourdomain.com  # Optional - use with Ingress
+  gateways:
+    - kr-app-gateway
+  http:
+    - retries:
+        attempts: 3
+        perTryTimeout: 2s
+        retryOn: connect-failure,refused-stream,5xx,gateway-error
+      timeout: 10s
+      route:
+        - destination:
+            host: kr-app.kr-biz.svc.cluster.local
+            port:
+              number: 80
+
+-----------
+#Istio Gateway (Expose via LoadBalancer)
+
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: kr-app-gateway
+  namespace: kr-biz
+spec:
+  selector:
+    istio: ingressgateway  # Matches default Istio ingress
+  servers:
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - "kr-app.yourdomain.com"
+
+
+-----------
+#Create the namespace and enable Istio injection:
+kubectl create namespace kr-biz
+kubectl label namespace kr-biz istio-injection=enabled
+
+kubectl apply -f kr-app-deployment.yaml
+kubectl apply -f kr-app-service.yaml
+kubectl apply -f kr-app-hpa.yaml
+kubectl apply -f kr-app-destinationrule.yaml
+kubectl apply -f kr-app-virtualservice.yaml
+kubectl apply -f kr-app-gateway.yaml
+#Replace the domain kr-app.yourdomain.com with your actual DNS and configure external DNS (Azure DNS / external-dns / Ingress IP → CNAME).
